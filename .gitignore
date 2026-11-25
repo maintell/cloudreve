@@ -38,3 +38,8 @@ tmp/
 .devcontainer/
 cloudreve
 .DS_Store
+
+# Local build outputs (cross-compiled binaries, archives)
+build-linux/
+delphiEx/build/
+delphiEx/*.rar

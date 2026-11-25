@@ -80,6 +80,43 @@ func expectedChunkCount(s *fs.UploadSession) int {
 	return int((s.Props.Size + s.ChunkSize - 1) / s.ChunkSize)
 }
 
+const (
+	// minRelayChunkSize is the minimum part size accepted by object storage
+	// multipart upload (COS: 1 MiB).
+	minRelayChunkSize int64 = 1 << 20
+	// maxRelayChunkSize is the maximum part size (COS: 5 GiB).
+	maxRelayChunkSize int64 = 5 << 30
+	// maxRelayChunkPartNum is the maximum number of parts (COS: 10000).
+	maxRelayChunkPartNum int64 = 10000
+)
+
+// canRelayChunk reports whether a relayed upload session can be chunked on the
+// client-to-server hop while still landing as a storage-side multipart object.
+func canRelayChunk(session *fs.UploadSession) bool {
+	if session == nil || session.Props == nil || session.Policy == nil {
+		return false
+	}
+
+	size := session.Policy.Settings.ChunkSize
+	if size < minRelayChunkSize || size > maxRelayChunkSize {
+		return false
+	}
+
+	// Empty objects have no part to upload; keep them on the whole-object path,
+	// object storage rejects zero-byte parts.
+	if session.Props.Size <= 0 {
+		return false
+	}
+
+	// Server side encryption rewrites each chunk independently, so byte offsets
+	// would no longer match the plaintext layout.
+	if session.EncryptMetadata != nil {
+		return false
+	}
+
+	return (session.Props.Size+size-1)/size <= maxRelayChunkPartNum
+}
+
 func (m *manager) PreValidateUpload(ctx context.Context, dst *fs.URI, files ...fs.PreValidateFile) error {
 	return m.fs.PreValidateUpload(ctx, dst, files...)
 }
@@ -143,6 +180,18 @@ func (m *manager) CreateUploadSession(ctx context.Context, req *fs.UploadRequest
 		credential.ChunkSize = 0
 		credential.EncryptMetadata = nil
 		uploadSession.Props.ClientSideEncrypted = false
+
+		// If the storage handler backs relayed chunk upload with its native
+		// multipart upload, keep chunking enabled so clients can resume.
+		if chunker, ok := d.(driver.RelayChunkedHandler); ok && canRelayChunk(uploadSession) {
+			if err := chunker.InitRelayUpload(ctx, uploadSession, req); err != nil {
+				m.OnUploadFailed(ctx, uploadSession)
+				return nil, err
+			}
+			uploadSession.ChunkSize = uploadSession.Policy.Settings.ChunkSize
+			credential.ChunkSize = uploadSession.ChunkSize
+			credential.EncryptMetadata = nil
+		}
 	}
 	credential.SessionID = uploadSession.Props.UploadSessionID
 	credential.Expires = req.Props.ExpireAt.Unix()
@@ -247,6 +296,15 @@ func (m *manager) Upload(ctx context.Context, req *fs.UploadRequest, policy *ent
 
 		if req.Seeker != nil {
 			req.Seeker = cryptor
+		}
+	}
+
+	if session != nil {
+		if chunker, ok := d.(driver.RelayChunkedHandler); ok && session.UploadID != "" && session.ChunkSize > 0 {
+			if err := chunker.PutRelayChunk(ctx, session, req); err != nil {
+				return serializer.NewError(serializer.CodeIOFailed, "Failed to upload file", err)
+			}
+			return nil
 		}
 	}
 
@@ -381,6 +439,12 @@ func (m *manager) CompleteUpload(ctx context.Context, session *fs.UploadSession)
 	d, err := m.GetStorageDriver(ctx, m.CastStoragePolicyOnSlave(ctx, session.Policy))
 	if err != nil {
 		return nil, err
+	}
+
+	if chunker, ok := d.(driver.RelayChunkedHandler); ok && session.UploadID != "" && session.ChunkSize > 0 {
+		if err := chunker.CompleteRelayUpload(ctx, session); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := d.CompleteUpload(ctx, session); err != nil {
